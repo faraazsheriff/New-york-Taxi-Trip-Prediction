@@ -1,0 +1,313 @@
+# =========================================================================================== #
+# Title - Gale Partners - Data Science Assessment
+# Objective - New York City Taxi | Predicting Number of Trips
+# Date - 29/12/2018
+# Author - Faraaz Sheriff
+# Version - vf
+# =========================================================================================== #
+#Setting working Directory
+setwd("C:/Users/HP/Desktop/Gale Test")
+
+# Loading packages
+if (!'pacman' %in% installed.packages()) install.packages('pacman') 
+library(pacman)
+pacman::p_load(dplyr,data.table,stringr,timeDate,Hmisc,tidyr,car,ggmap,geosphere,tidyverse,caTools,outliers,extremevalues,reshape2,lubridate,ggplot2,sqldf,xlsx,MASS,corrplot,caret,gbm,glmnet,forecast,randomForest,xgboost)
+
+# Clearing the environment and console once before start
+rm(list = setdiff(ls(), c()))
+cat("\014")
+
+# Reading Input files
+dataset <- fread('green_tripdata_2016-02.csv',header = TRUE,sep = ',',na.strings="",fill=T,blank.lines.skip = TRUE,stringsAsFactors=FALSE)
+
+# 1.Report the number of rows and columns
+dim(dataset)
+#1510722 rows & 21 columns
+
+# ------------------------------------------------------------------------------------------------------------------ #
+# ---------------------------------------------- Data Processing  -------------------------------------------------- #
+
+## Data Cleaning - Outlier Detection and Removal
+# Removing NAs
+apply(dataset, 2, function(x){sum(is.na(x))})
+dataset$Ehail_fee<-NULL
+dataset<-dataset[!is.na(Trip_type),]
+
+# Removing Outliers and Negative values
+summary(dataset)
+Hmisc::describe(dataset$VendorID)
+min(dataset$lpep_pickup_datetime);max(dataset$lpep_pickup_datetime)
+min(dataset$Lpep_dropoff_datetime);max(dataset$Lpep_dropoff_datetime)
+Hmisc::describe(dataset$Store_and_fwd_flag)
+Hmisc::describe(dataset$RateCodeID)
+dataset<-dataset[RateCodeID!=99,] 
+Hmisc::describe(dataset$Passenger_count)
+dataset<-dataset[Passenger_count<=6,] 
+
+dataset %>% summarise(min(Fare_amount), max(Fare_amount), mean(Fare_amount), median(Fare_amount), matrix(quantile(Fare_amount, probs=0.999999)))
+dataset<-dataset[Fare_amount<=558,Fare_amount:=ifelse(Fare_amount<0,0,Fare_amount),]
+
+dataset %>% summarise(min(Trip_distance), max(Trip_distance), mean(Trip_distance), median(Trip_distance), matrix(quantile(Trip_distance, probs=0.999999)))
+dataset<-dataset[Trip_distance>0 & Trip_distance<=178]
+
+dataset %>% summarise(min(Extra), max(Extra), mean(Extra), median(Extra), matrix(quantile(Extra, probs=0.999999)))
+dataset %>% summarise(min(MTA_tax), max(MTA_tax), mean(MTA_tax), median(MTA_tax), matrix(quantile(MTA_tax, probs=0.999999)))
+dataset %>% summarise(min(Tip_amount), max(Tip_amount), mean(Tip_amount), median(Tip_amount), matrix(quantile(Tip_amount, probs=0.999999)))
+
+# Assigning negative values to 0
+dataset<-dataset[,':='(Extra=ifelse(Extra<0,0,Extra),MTA_tax=ifelse(MTA_tax<0,0,MTA_tax),Tip_amount=ifelse(Tip_amount<0,0,Tip_amount)),]
+
+dataset %>% summarise(min(Tolls_amount), max(Tolls_amount), mean(Tolls_amount), median(Tolls_amount), matrix(quantile(Tolls_amount, probs=0.999999)))
+dataset %>% summarise(min(improvement_surcharge), max(improvement_surcharge), mean(improvement_surcharge), median(improvement_surcharge), matrix(quantile(improvement_surcharge, probs=0.999999)))
+dataset %>% summarise(min(Total_amount), max(Total_amount), mean(Total_amount), median(Total_amount), matrix(quantile(Total_amount, probs=0.999999)))
+
+# Capping the extreme value of Tolls amount and Total amount
+dataset<-dataset[Total_amount>0,':='(Tolls_amount=ifelse(Tolls_amount<0,0,ifelse(Tolls_amount>686,686,Tolls_amount)),improvement_surcharge=ifelse(improvement_surcharge<0,0,improvement_surcharge),Total_amount=ifelse(Total_amount<0,0,ifelse(Total_amount>931,931,Total_amount))),]
+Hmisc::describe(dataset$Payment_type)
+
+# ------------------------------------------------------------------------------------------------------------------ #
+# ---------------------------------------------- Feature Engineering  -------------------------------------------------- #
+
+## Adding new features to the dataset
+# Calculating Travel time and performing Outlier treatment 
+dataset[,travel_time:=as.numeric(difftime(strptime(Lpep_dropoff_datetime,"%Y-%m-%d %H:%M:%S"),
+                                          strptime(lpep_pickup_datetime,"%Y-%m-%d %H:%M:%S")))]
+dataset %>% summarise(min(travel_time), max(travel_time), mean(travel_time), median(travel_time), matrix(quantile(travel_time, probs=0.999999)))
+dataset<-dataset[travel_time>0,]
+dataset<-dataset[,travel_time :=ifelse(travel_time>3976,3976,travel_time)]
+
+# Calculating Time realted Variables & Haversine distance using Latitude and Longitude coordinates
+dataset[,type_of_day:=ifelse(isWeekday(dataset$lpep_pickup_datetime, wday=1:5)=="TRUE","Weekday","Weekend")]
+dataset[,dayOfWeek := wday(lpep_pickup_datetime)]
+dataset[,':='(hour =hour(lpep_pickup_datetime),Day=day(lpep_pickup_datetime))]
+dataset[,haversine_dist :=distHaversine(matrix(c(Pickup_longitude, Pickup_latitude), ncol = 2),
+                                        matrix(c(Dropoff_longitude,Dropoff_latitude), ncol = 2))*0.000621371]
+
+# Speed Calculation and Outlier treatment
+dataset[,speed :=Trip_distance/(travel_time/3600)]
+dataset %>% summarise(min(speed), max(speed), mean(speed), median(speed), matrix(quantile(speed, probs=0.997)))
+dataset<-as.data.table(dataset)
+dataset<-dataset[,speed :=ifelse(speed>45.29193,45.29193,speed)]
+
+# Creating a key of Pick up Coordinates
+dataset<-dataset[,':='(Pickup_latitude=round(Pickup_latitude,2),Pickup_longitude=round(Pickup_longitude,2))]
+dataset$pickup_key<-paste(dataset$Pickup_latitude,dataset$Pickup_longitude,sep="_")
+
+# Creating flags for each of the top 5 pickup locations, weekend flag and dollar per mile
+unique_records<- dataset[,.(Pickup_Frequency = .N),by = .(pickup_key)]
+top_5<-unique_records[order(-unique_records$Pickup_Frequency)]
+top_5<-top_5[,.SD[1:5]]
+dataset<-dataset[,':='(pop_pickup_1=ifelse(pickup_key=="40.69_-73.99",1,0),
+                       pop_pickup_2=ifelse(pickup_key=="40.79_-73.95",1,0),
+                       pop_pickup_3=ifelse(pickup_key=="40.72_-73.96",1,0),
+                       pop_pickup_4=ifelse(pickup_key=="40.81_-73.95",1,0),
+                       pop_pickup_5=ifelse(pickup_key=="40.81_-73.94",1,0))]
+dataset<-dataset[,':='(Weekend_flag=ifelse(type_of_day=="Weekday",0,1),Dollar_per_mile=(Total_amount/Trip_distance))]
+
+# Creating flags for Credit and Card type payments
+dataset<-dataset %>% mutate(payment_1 = case_when(Payment_type==1 ~ 1,TRUE ~ 0),
+                            payment_2 = case_when(Payment_type==2 ~ 1,TRUE ~ 0))
+
+
+# ------------------------------------------------------------------------------------------------------------------ #
+# -------------------------------------------Visualize Trip Distance by Time of Day -------------------------------------------------- #
+
+# 2.Visualize trip distance by time of day
+dataset<-as.data.frame(dataset) 
+distStatsByHour = dataset %>% 
+  group_by(hour) %>% 
+  summarise(mindist = min(Trip_distance), maxdist = max(Trip_distance), meandist = mean(Trip_distance), mediandist = median(Trip_distance))
+distStatsByHour %>% 
+  dplyr::select(-maxdist, -mindist) %>% 
+  gather(metric, value, -hour) %>% 
+  ggplot(aes(x = hour, y = value, colour = metric)) +
+  geom_line() + 
+  labs(x = "Hour of the day", y = "Trip Distance", title = "Trip Distance by Time of the Day")
+
+# Visualize Fare Amount by time of day
+dataset<-as.data.frame(dataset) 
+FareStatsByHour = dataset %>% 
+  group_by(hour) %>% 
+  summarise(minFare = min(Fare_amount), maxFare = max(Fare_amount), meanFare = mean(Fare_amount), medianFare = median(Fare_amount))
+FareStatsByHour %>% 
+  dplyr::select(-maxFare, -minFare) %>% 
+  gather(metric, value, -hour) %>% 
+  ggplot(aes(x = hour, y = value, colour = metric)) +
+  geom_line() + 
+  labs(x = "Hour of the day", y = "Fare Amount", title = "Fare Amount by Time of the Day")
+
+
+# ------------------------------------------------------------------------------------------------------------------ #
+# ------------------------------------- Most popular pickup locations on Weekdays vs Weekend -------------------------------------------------- #
+
+# Rounding up the Coordinates and counting the frequency of trips for the same pickup locations
+dataset<-as.data.table(dataset)
+popular_locations<- dataset[,.(Pickup_Frequency = .N),by = .(pickup_key,type_of_day)]
+
+# Calculating Popular pickup locations for Weekdays and Weekends
+popular_weekday<-popular_locations[type_of_day=='Weekday',]
+popular_weekday<-popular_weekday[order(-popular_weekday$Pickup_Frequency)]
+popular_weekday<-popular_weekday[, .SD[1:5]]
+popular_weekday_list<-as.data.table(str_split_fixed(popular_weekday$pickup_key, "_", 2))
+colnames(popular_weekday_list)<-c("lat","lon")
+
+popular_weekend<-popular_locations[type_of_day=='Weekend',]
+popular_weekend<-popular_weekend[order(-popular_weekend$Pickup_Frequency)]
+popular_weekend<-popular_weekend[, .SD[1:5]]
+popular_weekend_list<-as.data.table(str_split_fixed(popular_weekend$pickup_key, "_", 2))
+colnames(popular_weekend_list)<-c("lat","lon")
+
+# Plotting the popular pickup locations on weekdays vs weekend 
+gg<-ggplot()
+gg <- gg + geom_point(data=popular_weekday_list, aes(x=lon, y=lat, color="red")) + geom_point(data=popular_weekend_list, aes(x=lon, y=lat, color="blue"))
+gg <- gg +  coord_map()
+gg
+
+
+# ------------------------------------------------------------------------------------------------------------------ #
+# ---------------------------------------------- Model Building -------------------------------------------------- #
+
+# Data Preparation for Modeling - 
+dataset<-dataset %>% group_by(Day,dayOfWeek,hour,Weekend_flag) %>% 
+  dplyr::select(Day,dayOfWeek,hour,Weekend_flag,Passenger_count,Trip_distance,Total_amount,payment_1,payment_2,travel_time,speed,pop_pickup_1,pop_pickup_2,pop_pickup_3,pop_pickup_4,pop_pickup_5,Dollar_per_mile) %>% 
+  summarise(num_trips=n(),
+            total_pax = sum(Passenger_count), 
+            trip_dist_sum = sum(Trip_distance),
+            trip_dist_avg = mean(Trip_distance),
+            Trip_amount_sum = sum(Total_amount),
+            Trip_amount_avg = mean(Total_amount),
+            payment_credit = sum(payment_1),
+            payment_cash = sum(payment_2),
+            travel_time_sum = sum(travel_time),
+            travel_time_avg = mean(travel_time),
+            speed = mean(speed),
+            pop_pickup_1 = sum(pop_pickup_1),
+            pop_pickup_2 = sum(pop_pickup_2),
+            pop_pickup_3 = sum(pop_pickup_3),
+            pop_pickup_4 = sum(pop_pickup_4),
+            pop_pickup_5 = sum(pop_pickup_5),
+            Dollar_per_mile_avg = mean(Dollar_per_mile))
+View(dataset)
+
+# Visualizing Number of trips across different time variables
+ggplot(dataset, aes(x= hour, y = num_trips)) + geom_point(size = 2.5, color="navy") + xlab("Hous of the Day") + ylab("Number of trips") + ggtitle("Number of trips across the Day")
+ggplot(dataset, aes(x= Day, y = num_trips)) + geom_point(size = 2.5, color="navy") + xlab("Day of the month") + ylab("Number of trips") + ggtitle("Number of trips across the Month")
+ggplot(dataset, aes(x= dayOfWeek, y = num_trips)) + geom_point(size = 2.5, color="navy") + xlab("Day of the Week") + ylab("Number of trips") + ggtitle("Number of trips across the Week")
+
+# Relationship with Independent Variables
+ggplot(dataset, aes(x= Trip_amount_sum, y = num_trips)) + geom_point(size = 2.5, color="navy") + xlab("Trip Amount") + ylab("Number of trips") + ggtitle("Number of trips vs Trip Amount")
+ggplot(dataset, aes(x= trip_dist_sum, y = num_trips)) + geom_point(size = 2.5, color="navy") + xlab("Trip Distance") + ylab("Number of trips") + ggtitle("Number of trips vs Trip Distance")
+ggplot(dataset, aes(x= total_pax, y = num_trips)) + geom_point(size = 2.5, color="navy") + xlab("Total Passengers") + ylab("Number of trips") + ggtitle("Number of trips vs Total Passengers")
+ggplot(dataset, aes(x= travel_time_sum, y = num_trips)) + geom_point(size = 2.5, color="navy") + xlab("Travel Time") + ylab("Number of trips") + ggtitle("Number of trips vs Travel Time")
+
+# Splitting the dataset into the Training set and Test set
+set.seed(123)
+
+split = sample.split(dataset, SplitRatio = 0.7)
+dataset<-as.data.frame(dataset)
+training_set <- subset(dataset, split == TRUE)
+
+dataset<-as.data.table(dataset)
+testing_set<-dataset[Day==12 & hour %between% c(10,21),]
+
+# ---------------------------------------------- Model 1: Linear Regression Model -------------------------------------------------- #
+
+# Correlation Test
+View(cor(dataset, y = dataset$num_trips, use = "everything"))
+
+# Fitting Simple Linear Regression to the Training set
+model_1 = lm(formula = num_trips ~ 
+               # payment_credit+
+               # payment_cash+
+               speed+
+               # pop_pickup_1+
+               # pop_pickup_4+
+               total_pax,
+             # trip_dist_sum+
+             # Trip_amount_sum+
+             # travel_time_sum,
+             data = training_set)
+
+# Checking VIF of Independent Variables
+vif(model_1)
+
+# Predicting the Number of trips for next 12 hours after Feb 12 10:00 am
+Prediction_1 = round(predict(model_1, newdata = testing_set),0)
+abs_perc_error = abs(testing_set$num_trips - Prediction_1 )/testing_set$num_trips
+Results<-cbind(Prediction_1,testing_set$num_trips)
+
+# Model Evaluation
+summary(model_1)
+vif(model_1)
+RMSE(pred = Prediction_1,obs =  testing_set$num_trips)
+MAPE = 100*mean(abs_perc_error)
+MAPE
+
+# ---------------------------------------------- Model 2: Stepwise Regression -------------------------------------------------- #
+
+set.seed(678)
+model_2 <- stepAIC(lm(formula = num_trips ~ .,
+                      data = training_set),
+                   direction="both",
+                   trace=FALSE)
+
+# Model Evaluation
+summary(model_2)
+vif(model_2) ### Overfitted Model
+Prediction_2 = round(predict(model_2, newdata = testing_set),0)
+RMSE(pred = Prediction_2,obs =  testing_set$num_trips)
+
+
+# ---------------------------------------------- Model 3: RandomForest Model -------------------------------------------------- #
+
+# Fitting Random Forest Regression to the Training set
+set.seed(456)
+model_3<- randomForest(num_trips~ 
+                         total_pax+Trip_amount_sum,
+                       data= training_set)
+
+# Predicting the Number of trips for next 12 hours after Feb 12 10:00 am
+Prediction_3 = round(predict(model_3, newdata = testing_set),0)
+abs_perc_error = abs(testing_set$num_trips - Prediction_3 )/testing_set$num_trips
+Results<-cbind(Prediction_3,testing_set$num_trips)
+
+# Model Evaluation
+summary(model_3)
+RMSE(pred = Prediction_3,obs =  testing_set$num_trips)
+MAPE = 100*mean(abs_perc_error)
+MAPE
+
+
+# ---------------------------------------------- Model 4: XGBoost Model -------------------------------------------------- #
+
+set.seed(123)
+model_4 = xgboost(data = as.matrix(training_set), label = training_set$num_trips, nrounds = 23)
+
+# Predicting the Number of trips for next 12 hours after Feb 12 10:00 am
+Prediction_4 = round(predict(model_4, newdata = as.matrix(testing_set)),0)
+abs_perc_error = abs(testing_set$num_trips - Prediction_4 )/testing_set$num_trips
+Results<-as.data.frame(cbind(testing_set$hour,testing_set$num_trips,Prediction_4))
+colnames(Results)<-c('hour','Actual','Predicted')
+
+# Model Evaluation
+summary(model_4)
+RMSE(pred = Prediction_4,obs =  testing_set$num_trips)
+MAPE = 100*mean(abs_perc_error)
+MAPE
+
+# ------------------------------------------------------------------------------------------------------------------ #
+# ------------------------------------- Visualization of Model Output -------------------------------------------------- #
+
+# From the above, we know that XGBoost model has given the best results in terms of RMSE
+plot(Results$Actual,type = "o",col = "red", xlab = "Hour", ylab = "Number of Trips", 
+     main = "Actuals vs Predicted")
+lines(Results$Predicted, type = "o", col = "blue")
+
+# ------------------------------------------------------------------------------------------------------------------ #
+# ---------------------------------------------- Exporting Results -------------------------------------------------- #
+
+fwrite(Results,"Results.csv",row.names = FALSE)
+
+# ------------------------------------------------------------------------------------------------------------------ #
+# ------------------------------------------------------------------------------------------------------------------ #
+
