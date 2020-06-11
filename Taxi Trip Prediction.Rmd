@@ -1,5 +1,5 @@
 ---
-title: "Gale - Data Science Assessment"
+title: "Data Science Assessment"
 author: "Faraaz Sheriff"
 date: "29/12/2018"
 output:
