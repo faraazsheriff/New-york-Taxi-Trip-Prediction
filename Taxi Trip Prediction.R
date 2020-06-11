@@ -1,5 +1,5 @@
 # =========================================================================================== #
-# Title - Gale Partners - Data Science Assessment
+# Title - Data Science Assessment
 # Objective - New York City Taxi | Predicting Number of Trips
 # Date - 29/12/2018
 # Author - Faraaz Sheriff
